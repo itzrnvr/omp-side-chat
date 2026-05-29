@@ -1,10 +1,14 @@
 /**
- * Side Chat — Full-screen multi-turn ephemeral conversation.
+ * Side Chat — Multi-turn ephemeral conversation with inline TUI.
  *
  * Registers:
- *   /side           — Open side chat (resumes previous if any)
- *   /side close     — Close and save current side chat
- *   /side clear     — Close and discard current side chat
+ *   /side           — Open/resume side chat
+ *   /side close     — Close and save
+ *   /side clear     — Close and discard
+ *
+ * Uses setWidget for the chat view and onTerminalInput for raw keystrokes
+ * so the user types directly in the main editor area while the side chat
+ * widget renders below. Agent turn runs normally — no blocking.
  */
 
 import type {
@@ -13,8 +17,7 @@ import type {
 	ExtensionContext,
 	ExtensionUIContext,
 } from "@oh-my-pi/pi-coding-agent";
-import { Container, Input } from "@oh-my-pi/pi-tui";
-import type { Component } from "@oh-my-pi/pi-tui";
+import { Input } from "@oh-my-pi/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -38,43 +41,16 @@ function save(s: SideSession) {
 function load(): SideSession | undefined {
 	try { return JSON.parse(fs.readFileSync(path.join(DIR, "latest.json"), "utf-8")); } catch {}
 }
-function clear() { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} }
+function clearSave() { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} }
 
 // ---------------------------------------------------------------------------
 // Prompt
 // ---------------------------------------------------------------------------
 
-function prompt(q: string, hist: SideExchange[]): string {
+function makePrompt(q: string, hist: SideExchange[]): string {
 	const h = hist.length === 0 ? "" :
 		"\nPrevious exchanges:\n" + hist.map((e, i) => `Q${i+1}: ${e.question}\nA${i+1}: ${e.answer}`).join("\n\n") + "\n";
 	return `<side>\nThis is an ephemeral side conversation. Answer briefly using existing context.\nDO NOT use any tools. DO NOT ask follow-up questions.\n${h}Question: ${q}\n</side>`;
-}
-
-// ---------------------------------------------------------------------------
-// History renderer
-// ---------------------------------------------------------------------------
-
-function historyLines(
-	ex: SideExchange[], sq: string | undefined, sa: string,
-	theme: ExtensionUIContext["theme"], w: number, max: number,
-): string[] {
-	const out: string[] = [];
-	const mw = Math.max(w - 4, 40);
-	const wrap = (t: string, m: number) => t.split("\n").flatMap(l => l.length <= m ? [l] : (l.match(new RegExp(`.{1,${m}}`, "g")) ?? [l]));
-
-	for (let i = 0; i < ex.length; i++) {
-		out.push(theme.fg("accent", `▸ ${ex[i].question}`));
-		for (const l of wrap(ex[i].answer, mw)) out.push(`  ${l}`);
-		if (i < ex.length - 1) out.push("");
-	}
-	if (sq !== undefined) {
-		if (ex.length) out.push("");
-		out.push(theme.fg("accent", `▸ ${sq}`));
-		for (const l of wrap(sa || "⋯", mw)) out.push(`  ${l}`);
-	}
-	if (out.length > max) return out.slice(out.length - max);
-	while (out.length < max) out.push("");
-	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,99 +63,189 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let sq = "";
 	let sa = "";
 	let expecting = false;
-	let kick: (() => void) | undefined;
+	let active = false;
+	let unsubInput: (() => void) | undefined;
+	const inp = new Input();
 
-	pi.on("message_update", (ev) => {
-		if (!streaming || !expecting) return;
-		if (ev.assistantMessageEvent?.type === "text_delta") { sa += ev.assistantMessageEvent.delta ?? ""; kick?.(); }
+	// -------------------------------------------------------------------
+	// Render
+	// -------------------------------------------------------------------
+
+	function render(ctx: { ui: ExtensionUIContext }) {
+		if (!session) {
+			ctx.ui.setWidget("side", undefined);
+			ctx.ui.setStatus("side", undefined);
+			return;
+		}
+
+		const theme = ctx.ui.theme;
+		const lines: string[] = [];
+		const n = session.exchanges.length;
+		const icon = streaming ? "↔" : "💬";
+
+		lines.push(theme.fg("accent", theme.bold(`${icon} Side Chat${n ? ` (${n})` : ""}`)));
+		lines.push(theme.fg("dim", "─".repeat(60)));
+		lines.push("");
+
+		for (let i = 0; i < session.exchanges.length; i++) {
+			const ex = session.exchanges[i];
+			lines.push(theme.fg("accent", `  ▸ ${ex.question}`));
+			for (const l of ex.answer.split("\n")) lines.push(`    ${l}`);
+			if (i < session.exchanges.length - 1) lines.push("");
+		}
+
+		if (streaming) {
+			if (session.exchanges.length) lines.push("");
+			lines.push(theme.fg("accent", `  ▸ ${sq}`));
+			if (sa) {
+				for (const l of sa.split("\n")) lines.push(`    ${l}`);
+			} else {
+				lines.push(theme.fg("dim", "    ⋯"));
+			}
+		}
+
+		lines.push("");
+		lines.push(theme.fg("dim", streaming
+			? "  Streaming... · Esc to cancel and close"
+			: "  Type question + Enter to ask · Esc to close and save"));
+
+		// Show current input buffer
+		const buf = inp.getValue();
+		if (buf) {
+			lines.push("");
+			lines.push(theme.fg("accent", `  > ${buf}█`));
+		}
+
+		ctx.ui.setWidget("side", lines, { placement: "belowEditor" });
+		ctx.ui.setStatus("side", streaming ? "↔ Side chat" : "💬 Side chat");
+	}
+
+	// -------------------------------------------------------------------
+	// Events
+	// -------------------------------------------------------------------
+
+	pi.on("message_update", (event, ctx: ExtensionContext) => {
+		if (!streaming || !expecting || !session) return;
+		if (event.assistantMessageEvent?.type === "text_delta") {
+			sa += event.assistantMessageEvent.delta ?? "";
+			render(ctx);
+		}
 	});
 
-	pi.on("message_end", () => {
-		if (!streaming || !expecting) return;
+	pi.on("message_end", (_event, ctx: ExtensionContext) => {
+		if (!streaming || !expecting || !session) return;
 		expecting = false;
-		session!.exchanges.push({ question: sq, answer: sa.trim() || "(no answer)" });
+		session.exchanges.push({ question: sq, answer: sa.trim() || "(no answer)" });
 		streaming = false; sq = ""; sa = "";
-		save(session!); kick?.();
+		save(session);
+		render(ctx);
 	});
+
+	// -------------------------------------------------------------------
+	// Open/Close helpers (need ctx)
+	// -------------------------------------------------------------------
+
+	function close(ctx: { ui: ExtensionUIContext }) {
+		if (streaming && session) {
+			session.exchanges.push({ question: sq, answer: sa || "(cancelled)" });
+			streaming = false; expecting = false; sq = ""; sa = "";
+		}
+		if (session) save(session);
+		session = undefined;
+		active = false;
+		inp.setValue("");
+		unsubInput?.();
+		unsubInput = undefined;
+		render(ctx);
+	}
+
+	function openSession(ctx: ExtensionCommandContext) {
+		if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
+		active = true;
+		inp.setValue("");
+
+		// Register terminal input listener
+		unsubInput = ctx.ui.onTerminalInput((data: string) => {
+			if (!active || !session) return;
+
+			// Escape — close
+			if (data === "\x1b") {
+				close(ctx);
+				return { consume: true };
+			}
+			// Ctrl+C — close
+			if (data === "\x03") {
+				close(ctx);
+				return { consume: true };
+			}
+			// Enter — submit
+			if (data === "\n" || data === "\r") {
+				const val = inp.getValue().trim();
+				if (!val) return { consume: true };
+				if (streaming) {
+					session.exchanges.push({ question: sq, answer: sa || "(cancelled)" });
+					streaming = false; expecting = false;
+				}
+				sq = val; sa = ""; streaming = true;
+				inp.setValue("");
+				render(ctx);
+				expecting = true;
+				pi.sendUserMessage(makePrompt(sq, session.exchanges));
+				return { consume: true };
+			}
+
+			// Forward all other keys to input
+			inp.handleInput(data);
+			render(ctx);
+			return { consume: true };
+		});
+
+		render(ctx);
+		ctx.ui.notify("💬 Side chat active — type your question · Esc to close", "info");
+	}
+
+	// -------------------------------------------------------------------
+	// Command: /side
+	// -------------------------------------------------------------------
 
 	pi.registerCommand("side", {
-		description: "Full-screen side conversation",
+		description: "Multi-turn side conversation",
 		getArgumentCompletions: (pfx) => {
 			const s: string[] = [];
 			if (session || load()) s.push("resume");
 			if (session) s.push("close", "clear");
-			return s.filter(s => !pfx || s.startsWith(pfx)).map(s => ({ label: s, value: s }));
+			return s.filter(v => !pfx || v.startsWith(pfx)).map(v => ({ label: v, value: v }));
 		},
 		handler: async (args, ctx) => {
 			const cmd = args.trim().toLowerCase();
 
 			if (cmd === "close") {
-				if (session) save(session);
-				session = undefined; streaming = false; expecting = false;
-				ctx.ui.notify("Side chat saved", "info"); return;
+				close(ctx);
+				ctx.ui.notify("Side chat saved", "info");
+				return;
 			}
 			if (cmd === "clear") {
-				session = undefined; streaming = false; expecting = false; clear();
-				ctx.ui.notify("Side chat cleared", "info"); return;
+				session = undefined; streaming = false; expecting = false; active = false;
+				sq = ""; sa = "";
+				unsubInput?.(); unsubInput = undefined;
+				clearSave();
+				render(ctx);
+				ctx.ui.notify("Side chat cleared", "info");
+				return;
 			}
 			if (cmd === "resume") {
 				if (!session) session = load();
 				if (!session) { ctx.ui.notify("No previous side chat", "warning"); return; }
-			} else if (cmd) {
-				ctx.ui.notify("Usage: /side | /side close | /side clear | /side resume", "info"); return;
+				openSession(ctx);
+				return;
+			}
+			if (cmd) {
+				ctx.ui.notify("Usage: /side | /side close | /side clear | /side resume", "info");
+				return;
 			}
 
-			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
-
-			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-				const input = new Input();
-				input.onSubmit = (v: string) => {
-					if (!v.trim()) return;
-					if (streaming) {
-						session!.exchanges.push({ question: sq, answer: sa || "(cancelled)" });
-						streaming = false; expecting = false;
-					}
-					sq = v.trim(); sa = ""; streaming = true;
-					input.setValue(""); tui.requestRender();
-					expecting = true;
-					pi.sendUserMessage(prompt(sq, session!.exchanges));
-				};
-				input.onEscape = () => { save(session!); done(undefined); };
-
-				const hdr: Component = {
-					render(_w: number) {
-						const n = session!.exchanges.length;
-						return [theme.fg("accent", theme.bold(`── Side Chat${n ? ` (${n})` : ""} ──`)) + theme.fg("dim", "  Enter=ask · Esc=close")];
-					},
-					invalidate() {},
-				};
-
-				const hist: Component = {
-					render(w: number) {
-						const m = Math.max(tui.terminal.rows - 3, 3);
-						return historyLines(session!.exchanges, streaming ? sq : undefined, sa, theme, w, m);
-					},
-					invalidate() {},
-				};
-
-				const box = new Container();
-				box.addChild(hdr);
-				box.addChild(hist);
-				box.addChild(input);
-
-				kick = () => tui.requestRender();
-
-				return {
-					render(w: number) { return box.render(w); },
-					invalidate() { box.invalidate(); },
-					handleInput(d: string) {
-						if (d === "\x03") { save(session!); done(undefined); return; }
-						input.handleInput(d); tui.requestRender();
-					},
-				};
-			});
-
-			kick = undefined;
+			// Default: open
+			openSession(ctx);
 		},
 	});
 }
