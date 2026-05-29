@@ -1,7 +1,7 @@
 /**
- * Side Chat — Multi-turn ephemeral conversation.
+ * Side Chat — Multi-turn ephemeral conversation with live streaming.
  *
- * /side <question>  — Ask a question (live-streaming answer)
+ * /side <question>  — Ask a question (answer streams in widget)
  * /side close       — Close and save session
  * /side clear       — Discard session
  * /side             — Resume or show status
@@ -25,31 +25,35 @@ const save = (s: SideSession) => { try { fs.mkdirSync(DIR, { recursive: true });
 const load = (): SideSession | undefined => { try { return JSON.parse(fs.readFileSync(path.join(DIR, "latest.json"), "utf-8")); } catch {} };
 const nuke = () => { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} };
 
-function sidePrompt(q: string, hist: SideExchange[]): string {
+function prompt(q: string, hist: SideExchange[]): string {
 	const h = hist.length ? "\nPrevious exchanges:\n" + hist.map((e, i) => `Q${i+1}: ${e.question}\nA${i+1}: ${e.answer}`).join("\n\n") + "\n" : "";
 	return `<side>\nEphemeral side conversation. Answer briefly from context. NO tools. NO follow-up questions.\n${h}Question: ${q}\n</side>`;
 }
 
-function widgetLines(
+function widget(
 	s: SideSession, pending: boolean, pq: string, pa: string,
-	theme: ExtensionUIContext["theme"],
+	t: ExtensionUIContext["theme"],
 ): string[] {
 	const lines: string[] = [];
 	const n = s.exchanges.length;
 	const icon = pending ? "↔" : "💬";
-	lines.push(theme.fg("accent", theme.bold(`${icon} Side Chat${n ? ` (${n})` : ""} ─ /side <q> to ask · /side close to dismiss`)));
-	lines.push(theme.fg("dim", "─".repeat(60)));
-	for (let i = 0; i < n; i++) {
+	lines.push(t.fg("accent", t.bold(`${icon} Side Chat${n ? ` (${n})` : ""} ─ /side <q> · /side close`)));
+	lines.push(t.fg("dim", "─".repeat(60)));
+
+	const MAX = 5;
+	const start = Math.max(0, n - MAX);
+	if (start > 0) lines.push(t.fg("dim", `  ... (${start} earlier)`));
+	for (let i = start; i < n; i++) {
 		const e = s.exchanges[i];
-		lines.push(theme.fg("accent", `  ▸ ${e.question}`));
+		lines.push(t.fg("accent", `  ▸ ${e.question}`));
 		for (const l of e.answer.split("\n").slice(0, 30)) lines.push(`    ${l}`);
 		if (i < n - 1) lines.push("");
 	}
 	if (pending) {
 		if (n) lines.push("");
-		lines.push(theme.fg("accent", `  ▸ ${pq}`));
+		lines.push(t.fg("accent", `  ▸ ${pq}`));
 		if (pa) for (const l of pa.split("\n")) lines.push(`    ${l}`);
-		else lines.push(theme.fg("dim", "    ⋯"));
+		else lines.push(t.fg("dim", "    ⋯"));
 	}
 	return lines;
 }
@@ -62,11 +66,10 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 	function render(ui: ExtensionUIContext) {
 		if (!session) { ui.setWidget("side", undefined); ui.setStatus("side", undefined); return; }
-		ui.setWidget("side", widgetLines(session, pending, pq, pa, ui.theme), { placement: "belowEditor" });
+		ui.setWidget("side", widget(session, pending, pq, pa, ui.theme), { placement: "belowEditor" });
 		ui.setStatus("side", pending ? "↔ Side chat" : "💬 Side chat");
 	}
 
-	// Live streaming
 	pi.on("message_update", (event, ctx: ExtensionContext) => {
 		if (!pending || !session) return;
 		if (event.assistantMessageEvent?.type === "text_delta") {
@@ -75,7 +78,6 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Answer capture
 	pi.on("message_end", (event, ctx: ExtensionContext) => {
 		if (!pending || !session) return;
 		const msg = event.message as { role: string; content: unknown };
@@ -87,7 +89,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("side", {
-		description: "Multi-turn side conversation",
+		description: "Multi-turn side conversation with live streaming",
 		getArgumentCompletions: (pfx) => {
 			const s: string[] = [];
 			if (session || load()) s.push("resume");
@@ -130,7 +132,6 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			// Ask question
 			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 			if (pending) {
 				session.exchanges.push({ question: pq, answer: pa || "(superseded)" });
@@ -138,7 +139,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			}
 			pq = raw; pa = ""; pending = true;
 			render(ctx.ui);
-			pi.sendUserMessage(sidePrompt(pq, session.exchanges));
+			pi.sendUserMessage(prompt(pq, session.exchanges));
 		},
 	});
 }
