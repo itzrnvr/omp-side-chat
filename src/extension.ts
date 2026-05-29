@@ -155,6 +155,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				const panel: Component = {
 					handleInput(data: string) {
 						input.handleInput(data);
+						tui.requestRender(true);
 					},
 					render(w: number) {
 						const lines: string[] = [];
@@ -229,6 +230,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 					// Only while overlay is active
 					if (!sideOverlay) return;
 					input.handleInput(data);
+					tui.requestRender(true);
 					return { consume: true };
 				});
 
