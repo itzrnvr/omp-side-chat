@@ -1,13 +1,10 @@
 /**
  * Side Chat — Multi-turn ephemeral conversation.
  *
- * /side <question>  — Ask a question
+ * /side <question>  — Ask a question (live-streaming answer)
  * /side close       — Close and save session
  * /side clear       — Discard session
  * /side             — Resume or show status
- *
- * Questions are sent via sendUserMessage with no-tools prompt.
- * Answers captured from message_end. Session persists to disk.
  */
 
 import type {
@@ -33,22 +30,26 @@ function sidePrompt(q: string, hist: SideExchange[]): string {
 	return `<side>\nEphemeral side conversation. Answer briefly from context. NO tools. NO follow-up questions.\n${h}Question: ${q}\n</side>`;
 }
 
-function widgetLines(session: SideSession, pending: boolean, pendQ: string, theme: ExtensionUIContext["theme"]): string[] {
+function widgetLines(
+	s: SideSession, pending: boolean, pq: string, pa: string,
+	theme: ExtensionUIContext["theme"],
+): string[] {
 	const lines: string[] = [];
-	const n = session.exchanges.length;
+	const n = s.exchanges.length;
 	const icon = pending ? "↔" : "💬";
 	lines.push(theme.fg("accent", theme.bold(`${icon} Side Chat${n ? ` (${n})` : ""} ─ /side <q> to ask · /side close to dismiss`)));
 	lines.push(theme.fg("dim", "─".repeat(60)));
-	for (let i = 0; i < session.exchanges.length; i++) {
-		const e = session.exchanges[i];
+	for (let i = 0; i < n; i++) {
+		const e = s.exchanges[i];
 		lines.push(theme.fg("accent", `  ▸ ${e.question}`));
 		for (const l of e.answer.split("\n").slice(0, 30)) lines.push(`    ${l}`);
-		if (i < session.exchanges.length - 1) lines.push("");
+		if (i < n - 1) lines.push("");
 	}
 	if (pending) {
 		if (n) lines.push("");
-		lines.push(theme.fg("accent", `  ▸ ${pendQ}`));
-		lines.push(theme.fg("dim", "    ⋯ streaming"));
+		lines.push(theme.fg("accent", `  ▸ ${pq}`));
+		if (pa) for (const l of pa.split("\n")) lines.push(`    ${l}`);
+		else lines.push(theme.fg("dim", "    ⋯"));
 	}
 	return lines;
 }
@@ -56,27 +57,31 @@ function widgetLines(session: SideSession, pending: boolean, pendQ: string, them
 export default function sideExtension(pi: ExtensionAPI): void {
 	let session: SideSession | undefined;
 	let pending = false;
-	let pendQ = "";
+	let pq = "";
+	let pa = "";
 
 	function render(ui: ExtensionUIContext) {
 		if (!session) { ui.setWidget("side", undefined); ui.setStatus("side", undefined); return; }
-		ui.setWidget("side", widgetLines(session, pending, pendQ, ui.theme), { placement: "belowEditor" });
+		ui.setWidget("side", widgetLines(session, pending, pq, pa, ui.theme), { placement: "belowEditor" });
 		ui.setStatus("side", pending ? "↔ Side chat" : "💬 Side chat");
 	}
 
+	// Live streaming
+	pi.on("message_update", (event, ctx: ExtensionContext) => {
+		if (!pending || !session) return;
+		if (event.assistantMessageEvent?.type === "text_delta") {
+			pa += event.assistantMessageEvent.delta ?? "";
+			render(ctx.ui);
+		}
+	});
+
+	// Answer capture
 	pi.on("message_end", (event, ctx: ExtensionContext) => {
 		if (!pending || !session) return;
 		const msg = event.message as { role: string; content: unknown };
 		if (msg.role !== "assistant") return;
-		let answer = "";
-		if (typeof msg.content === "string") answer = msg.content;
-		else if (Array.isArray(msg.content)) {
-			for (const p of msg.content) {
-				if (typeof p === "object" && p && "text" in p) answer += (p as { text: string }).text;
-			}
-		}
-		session.exchanges.push({ question: pendQ, answer: answer.trim() || "(no answer)" });
-		pending = false; pendQ = "";
+		session.exchanges.push({ question: pq, answer: pa.trim() || "(no answer)" });
+		pending = false; pq = ""; pa = "";
 		save(session);
 		render(ctx.ui);
 	});
@@ -93,11 +98,10 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			const raw = args.trim();
 			const cmd = raw.toLowerCase();
 
-			// Close: /side close
 			if (cmd === "close") {
 				if (pending && session) {
-					session.exchanges.push({ question: pendQ, answer: "(cancelled)" });
-					pending = false; pendQ = "";
+					session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
+					pending = false; pq = ""; pa = "";
 				}
 				if (session) save(session);
 				session = undefined;
@@ -105,16 +109,12 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Side chat saved", "info");
 				return;
 			}
-
-			// Clear: /side clear
 			if (cmd === "clear") {
-				session = undefined; pending = false; pendQ = ""; nuke();
+				session = undefined; pending = false; pq = ""; pa = ""; nuke();
 				render(ctx.ui);
 				ctx.ui.notify("Side chat cleared", "info");
 				return;
 			}
-
-			// Resume: /side resume
 			if (cmd === "resume") {
 				if (!session) session = load();
 				if (!session) { ctx.ui.notify("No previous session", "warning"); return; }
@@ -122,8 +122,6 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Resumed side chat (${session.exchanges.length} exchanges)`, "info");
 				return;
 			}
-
-			// No args: show status or resume
 			if (!raw) {
 				if (!session) session = load();
 				if (!session) { ctx.ui.notify("Usage: /side <question>", "info"); return; }
@@ -132,16 +130,15 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			// Ask question: /side <question>
+			// Ask question
 			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 			if (pending) {
-				session.exchanges.push({ question: pendQ, answer: "(superseded)" });
+				session.exchanges.push({ question: pq, answer: pa || "(superseded)" });
 				pending = false;
 			}
-			pendQ = raw;
-			pending = true;
+			pq = raw; pa = ""; pending = true;
 			render(ctx.ui);
-			pi.sendUserMessage(sidePrompt(pendQ, session.exchanges));
+			pi.sendUserMessage(sidePrompt(pq, session.exchanges));
 		},
 	});
 }
