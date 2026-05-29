@@ -56,12 +56,10 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let tuiRef: TUI | undefined;
 	let childProcess: ChildProcess | null = null;
 	let tmpDir: string | null = null;
+	let doneRef: (() => void) | undefined;
 
 	function cleanupTmp() {
-		if (tmpDir) {
-			try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-			tmpDir = null;
-		}
+		if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} tmpDir = null; }
 	}
 
 	function closeSidechat() {
@@ -77,15 +75,22 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		unsubInput = undefined;
 		sideOverlay?.hide();
 		sideOverlay = undefined;
+		// Request render first to clear the overlay visually
 		tuiRef?.requestRender(true);
+		// Then release the custom() handler
+		doneRef?.();
+		doneRef = undefined;
 		tuiRef = undefined;
 	}
 
 	function submitQuestion(question: string) {
 		if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 		if (!question.trim()) return;
+		if (question === "/close" || question === "/side close") {
+			closeSidechat();
+			return;
+		}
 		if (childProcess) {
-			// Kill previous in-flight question
 			childProcess.kill();
 			childProcess = null;
 			cleanupTmp();
@@ -94,16 +99,12 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				pending = false;
 			}
 		}
-		if (question === "/close" || question === "/side close") {
-			closeSidechat();
-			return;
-		}
 		pq = question.trim();
 		pa = "";
 		pending = true;
 		tuiRef?.requestRender(true);
 
-		// Write prompt to temp file (avoids shell quoting issues)
+		// Build prompt and write to temp file
 		const taskPrompt = buildTaskPrompt(pq, session.exchanges);
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "side-chat-"));
 		const promptPath = path.join(tmpDir, "prompt.md");
@@ -131,18 +132,14 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			pa = output.trim();
 			tuiRef?.requestRender(true);
 		});
-
-		child.stderr!.on("data", () => { /* discard */ });
+		child.stderr!.on("data", () => {});
 
 		child.on("close", (code) => {
 			cleanupTmp();
-			if (childProcess !== child) return; // superseded
+			if (childProcess !== child) return;
 			childProcess = null;
 			const answer = (code === 0 ? output.trim() : `(error: exit ${code})`) || "(no answer)";
-			if (session) {
-				session.exchanges.push({ question: pq, answer });
-				save(session);
-			}
+			if (session) { session.exchanges.push({ question: pq, answer }); save(session); }
 			pending = false; pq = ""; pa = "";
 			tuiRef?.requestRender(true);
 		});
@@ -167,14 +164,17 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Side chat cleared", "info");
 				return;
 			}
+			// If overlay already open, just submit the question
 			if (sideOverlay) {
 				if (raw) submitQuestion(raw);
 				return;
 			}
 			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 
+			// custom() blocks until doneRef() is called (in closeSidechat)
 			await ctx.ui.custom<void>(async (tui, theme, _kb, done) => {
 				tuiRef = tui;
+				doneRef = done;
 
 				const input = new Input();
 				input.onSubmit = (val: string) => {
@@ -186,6 +186,8 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 				const panel: Component = {
 					handleInput(data: string) {
+						// Explicit Esc/Ctrl+C handling
+						if (data === "\x1b" || data === "\x03") { closeSidechat(); return; }
 						input.handleInput(data);
 						tui.requestRender(true);
 					},
@@ -200,14 +202,14 @@ export default function sideExtension(pi: ExtensionAPI): void {
 						const title = `${icon} Side Chat${n ? ` (${n})` : ""}`;
 						lines.push(theme.fg("accent", theme.bold(`╭─ ${title}${"─".repeat(Math.max(0, w - title.length - 4))}`)));
 
-						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 10) / 4));
+						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 12) / 4));
 						const start = Math.max(0, n - MAX);
 						if (start > 0) lines.push(theme.fg("dim", `│  ... (${start} earlier)`));
 						for (let i = start; i < n; i++) {
 							const e = s.exchanges[i];
 							const q = e.question.length > cw - 5 ? e.question.slice(0, cw - 8) + "…" : e.question;
 							lines.push(theme.fg("accent", "│ ▸ ") + q);
-							for (const l of e.answer.split("\n").slice(0, 4)) {
+							for (const l of e.answer.split("\n").slice(0, 6)) {
 								lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
 							}
 							if (i < n - 1) lines.push(theme.fg("dim", "│"));
@@ -217,9 +219,8 @@ export default function sideExtension(pi: ExtensionAPI): void {
 							const q = pq.length > cw - 5 ? pq.slice(0, cw - 8) + "…" : pq;
 							lines.push(theme.fg("accent", "│ ▸ ") + q);
 							if (pa) {
-								// Show last few lines of streaming output
-								const answerLines = pa.split("\n");
-								for (const l of answerLines.slice(-4)) {
+								const aLines = pa.split("\n");
+								for (const l of aLines.slice(-6)) {
 									lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
 								}
 							} else {
@@ -231,7 +232,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 						const inputLines = input.render(w - 2).map((l) => theme.fg("accent", "│ ") + l);
 						lines.push(...inputLines);
 						lines.push(theme.fg("accent", "╰" + "─".repeat(w - 2) + "╯"));
-						lines.push(theme.fg("dim", "  Type your question + Enter · Esc to exit"));
+						lines.push(theme.fg("dim", "  Type + Enter · Esc or /close to exit"));
 
 						return lines;
 					},
@@ -247,14 +248,17 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				unsubInput?.();
 				unsubInput = ctx.ui.onTerminalInput((data) => {
 					if (!sideOverlay) return;
+					// Explicit Esc handling
+					if (data === "\x1b" || data === "\x03") { closeSidechat(); return { consume: true }; }
 					input.handleInput(data);
 					tui.requestRender(true);
 					return { consume: true };
 				});
 
+				// Auto-submit initial question if provided
 				if (raw) submitQuestion(raw);
 
-				done(undefined);
+				// DON'T call done() — custom handler blocks until closeSidechat()
 				return { render() { return []; }, invalidate() {} };
 			}, { overlay: true });
 		},
