@@ -68,6 +68,8 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 	function submitQuestion(question: string) {
 		if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
+		// Reject empty submissions (handles CRLF double-submit)
+		if (!question.trim()) return;
 		if (pending) {
 			session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
 			pending = false;
@@ -76,7 +78,6 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			closeSidechat();
 			return;
 		}
-		if (!question.trim()) return;
 		pq = question.trim();
 		pa = "";
 		pending = true;
@@ -159,7 +160,8 @@ export default function sideExtension(pi: ExtensionAPI): void {
 					},
 					render(w: number) {
 						const lines: string[] = [];
-						const s = session!;
+						if (!session) return lines;
+						const s = session;
 						const n = s.exchanges.length;
 						const cw = Math.max(w - 4, 10);
 
