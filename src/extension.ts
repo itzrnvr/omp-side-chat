@@ -63,6 +63,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		unsubInput = undefined;
 		sideOverlay?.hide();
 		sideOverlay = undefined;
+		tuiRef?.requestRender(true);
 		tuiRef = undefined;
 	}
 
