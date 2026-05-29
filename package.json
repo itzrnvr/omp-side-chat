@@ -1,0 +1,23 @@
+{
+	"type": "module",
+	"name": "omp-side-chat",
+	"version": "0.1.0",
+	"description": "Multi-turn side conversation extension for omp",
+	"license": "MIT",
+	"scripts": {
+		"check": "biome check .",
+		"lint": "biome lint .",
+		"fmt": "biome format --write ."
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^13"
+	},
+	"omp": {
+		"extensions": [
+			"./src/extension.ts"
+		]
+	},
+	"files": [
+		"src"
+	]
+}
