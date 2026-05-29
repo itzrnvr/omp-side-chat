@@ -6,9 +6,8 @@
  * /side clear       — Clear saved session
  * /close            — Shortcut to close sidechat
  *
- * When sidechat is open, all input goes to the sidechat.
- * Questions run in a SEPARATE omp subprocess (--no-session, no tools).
- * Nothing appears in the main session.
+ * Spawns an isolated omp --mode json subprocess per question.
+ * Streams thinking + response tokens in real-time.
  */
 
 import type {
@@ -37,9 +36,8 @@ function buildTaskPrompt(question: string, history: SideExchange[]): string {
 	if (history.length) {
 		parts.push("\nPrevious exchanges:");
 		for (let i = 0; i < history.length; i++) {
-			const e = history[i];
-			parts.push(`Q${i + 1}: ${e.question}`);
-			parts.push(`A${i + 1}: ${e.answer}`);
+			parts.push(`Q${i + 1}: ${history[i].question}`);
+			parts.push(`A${i + 1}: ${history[i].answer}`);
 		}
 	}
 	parts.push(`\nQuestion: ${question}`);
@@ -50,7 +48,9 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let session: SideSession | undefined;
 	let pending = false;
 	let pq = "";
-	let pa = "";
+	let pa = "";       // accumulated response text
+	let thinking = ""; // accumulated reasoning text
+	let phase: "idle" | "thinking" | "responding" = "idle";
 	let sideOverlay: OverlayHandle | undefined;
 	let unsubInput: (() => void) | undefined;
 	let tuiRef: TUI | undefined;
@@ -67,17 +67,15 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		childProcess = null;
 		cleanupTmp();
 		if (pending && session) {
-			session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
-			pending = false; pq = ""; pa = "";
+			session.exchanges.push({ question: pq, answer: pa || thinking || "(cancelled)" });
+			pending = false; pq = ""; pa = ""; thinking = ""; phase = "idle";
 		}
 		if (session) save(session);
 		unsubInput?.();
 		unsubInput = undefined;
 		sideOverlay?.hide();
 		sideOverlay = undefined;
-		// Request render first to clear the overlay visually
 		tuiRef?.requestRender(true);
-		// Then release the custom() handler
 		doneRef?.();
 		doneRef = undefined;
 		tuiRef = undefined;
@@ -95,24 +93,25 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			childProcess = null;
 			cleanupTmp();
 			if (pending) {
-				session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
+				session.exchanges.push({ question: pq, answer: pa || thinking || "(cancelled)" });
 				pending = false;
 			}
 		}
 		pq = question.trim();
 		pa = "";
+		thinking = "";
+		phase = "idle";
 		pending = true;
 		tuiRef?.requestRender(true);
 
-		// Build prompt and write to temp file
 		const taskPrompt = buildTaskPrompt(pq, session.exchanges);
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "side-chat-"));
 		const promptPath = path.join(tmpDir, "prompt.md");
 		fs.writeFileSync(promptPath, taskPrompt, { mode: 0o600 });
 
-		// Spawn isolated omp subprocess
 		const child = spawn("omp", [
 			"-p",
+			"--mode", "json",
 			"--no-session",
 			"--no-extensions",
 			"--no-skills",
@@ -126,23 +125,61 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		});
 		childProcess = child;
 
-		let output = "";
+		let jsonBuf = "";
+
 		child.stdout!.on("data", (chunk: Buffer) => {
-			output += chunk.toString();
-			pa = output.trim();
-			tuiRef?.requestRender(true);
+			jsonBuf += chunk.toString();
+			// Process complete JSON lines
+			let newlineIdx: number;
+			while ((newlineIdx = jsonBuf.indexOf("\n")) !== -1) {
+				const line = jsonBuf.slice(0, newlineIdx).trim();
+				jsonBuf = jsonBuf.slice(newlineIdx + 1);
+				if (!line) continue;
+				try {
+					const evt = JSON.parse(line);
+					handleJsonEvent(evt);
+				} catch { /* skip malformed lines */ }
+			}
 		});
 		child.stderr!.on("data", () => {});
 
 		child.on("close", (code) => {
+			// Process any remaining buffer
+			if (jsonBuf.trim()) {
+				try { handleJsonEvent(JSON.parse(jsonBuf.trim())); } catch {}
+			}
 			cleanupTmp();
 			if (childProcess !== child) return;
 			childProcess = null;
-			const answer = (code === 0 ? output.trim() : `(error: exit ${code})`) || "(no answer)";
+			const answer = pa.trim() || "(no answer)";
 			if (session) { session.exchanges.push({ question: pq, answer }); save(session); }
-			pending = false; pq = ""; pa = "";
+			pending = false; pq = ""; pa = ""; thinking = ""; phase = "idle";
 			tuiRef?.requestRender(true);
 		});
+	}
+
+	function handleJsonEvent(evt: Record<string, unknown>) {
+		if (evt.type !== "message_update") return;
+		const aevt = evt.assistantMessageEvent as Record<string, unknown> | undefined;
+		if (!aevt) return;
+		const t = aevt.type as string;
+		const delta = aevt.delta as string | undefined;
+
+		if (t === "thinking_start") {
+			phase = "thinking";
+		} else if (t === "thinking_delta" && delta) {
+			thinking += delta;
+			tuiRef?.requestRender(true);
+		} else if (t === "thinking_end") {
+			// thinking complete, wait for text
+		} else if (t === "text_start") {
+			phase = "responding";
+		} else if (t === "text_delta" && delta) {
+			pa += delta;
+			tuiRef?.requestRender(true);
+		} else if (t === "text_end") {
+			// text complete
+		}
 	}
 
 	// /side command
@@ -164,14 +201,12 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Side chat cleared", "info");
 				return;
 			}
-			// If overlay already open, just submit the question
 			if (sideOverlay) {
 				if (raw) submitQuestion(raw);
 				return;
 			}
 			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 
-			// custom() blocks until doneRef() is called (in closeSidechat)
 			await ctx.ui.custom<void>(async (tui, theme, _kb, done) => {
 				tuiRef = tui;
 				doneRef = done;
@@ -186,7 +221,6 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 				const panel: Component = {
 					handleInput(data: string) {
-						// Explicit Esc/Ctrl+C handling
 						if (data === "\x1b" || data === "\x03") { closeSidechat(); return; }
 						input.handleInput(data);
 						tui.requestRender(true);
@@ -198,11 +232,11 @@ export default function sideExtension(pi: ExtensionAPI): void {
 						const n = s.exchanges.length;
 						const cw = Math.max(w - 4, 10);
 
-						const icon = pending ? "↔" : "💬";
-						const title = `${icon} Side Chat${n ? ` (${n})` : ""}`;
+						const statusIcon = phase === "thinking" ? "🧠" : pending ? "↔" : "💬";
+						const title = `${statusIcon} Side Chat${n ? ` (${n})` : ""}`;
 						lines.push(theme.fg("accent", theme.bold(`╭─ ${title}${"─".repeat(Math.max(0, w - title.length - 4))}`)));
 
-						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 12) / 4));
+						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 14) / 5));
 						const start = Math.max(0, n - MAX);
 						if (start > 0) lines.push(theme.fg("dim", `│  ... (${start} earlier)`));
 						for (let i = start; i < n; i++) {
@@ -214,17 +248,30 @@ export default function sideExtension(pi: ExtensionAPI): void {
 							}
 							if (i < n - 1) lines.push(theme.fg("dim", "│"));
 						}
+
 						if (pending) {
 							if (n) lines.push(theme.fg("dim", "│"));
 							const q = pq.length > cw - 5 ? pq.slice(0, cw - 8) + "…" : pq;
 							lines.push(theme.fg("accent", "│ ▸ ") + q);
+
+							// Show thinking (reasoning) in dim style
+							if (thinking) {
+								const recentThink = thinking.split("\n").slice(-3);
+								for (const l of recentThink) {
+									lines.push(theme.fg("dim", "│  💭 ") + theme.fg("dim", l.length > cw - 6 ? l.slice(0, cw - 9) + "…" : l));
+								}
+							}
+
+							// Show response text
 							if (pa) {
 								const aLines = pa.split("\n");
 								for (const l of aLines.slice(-6)) {
 									lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
 								}
-							} else {
+							} else if (phase === "idle" && !thinking) {
 								lines.push(theme.fg("dim", "│  ⋯ starting subprocess"));
+							} else if (phase === "thinking" && !pa) {
+								lines.push(theme.fg("dim", "│  ⋯ thinking..."));
 							}
 						}
 
@@ -248,17 +295,14 @@ export default function sideExtension(pi: ExtensionAPI): void {
 				unsubInput?.();
 				unsubInput = ctx.ui.onTerminalInput((data) => {
 					if (!sideOverlay) return;
-					// Explicit Esc handling
 					if (data === "\x1b" || data === "\x03") { closeSidechat(); return { consume: true }; }
 					input.handleInput(data);
 					tui.requestRender(true);
 					return { consume: true };
 				});
 
-				// Auto-submit initial question if provided
 				if (raw) submitQuestion(raw);
 
-				// DON'T call done() — custom handler blocks until closeSidechat()
 				return { render() { return []; }, invalidate() {} };
 			}, { overlay: true });
 		},
