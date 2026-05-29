@@ -7,7 +7,7 @@
  * /close            — Shortcut to close sidechat
  *
  * Spawns an isolated omp --mode json subprocess per question.
- * Streams thinking + response tokens in real-time.
+ * Streams thinking (reasoning) + response tokens in real-time.
  */
 
 import type {
@@ -57,17 +57,32 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let childProcess: ChildProcess | null = null;
 	let tmpDir: string | null = null;
 	let doneRef: (() => void) | undefined;
+	let renderTimer: ReturnType<typeof setInterval> | null = null;
+
+	const RENDER_FPS = 10; // 10 re-renders per second during streaming
+
+	function startStreamRender() {
+		stopStreamRender();
+		renderTimer = setInterval(() => {
+			tuiRef?.requestRender(true);
+		}, 1000 / RENDER_FPS);
+	}
+
+	function stopStreamRender() {
+		if (renderTimer) { clearInterval(renderTimer); renderTimer = null; }
+	}
 
 	function cleanupTmp() {
 		if (tmpDir) { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} tmpDir = null; }
 	}
 
 	function closeSidechat() {
+		stopStreamRender();
 		childProcess?.kill();
 		childProcess = null;
 		cleanupTmp();
 		if (pending && session) {
-			session.exchanges.push({ question: pq, answer: pa || thinking || "(cancelled)" });
+			session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
 			pending = false; pq = ""; pa = ""; thinking = ""; phase = "idle";
 		}
 		if (session) save(session);
@@ -93,7 +108,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			childProcess = null;
 			cleanupTmp();
 			if (pending) {
-				session.exchanges.push({ question: pq, answer: pa || thinking || "(cancelled)" });
+				session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
 				pending = false;
 			}
 		}
@@ -103,6 +118,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		phase = "idle";
 		pending = true;
 		tuiRef?.requestRender(true);
+		startStreamRender();
 
 		const taskPrompt = buildTaskPrompt(pq, session.exchanges);
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "side-chat-"));
@@ -129,25 +145,21 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 		child.stdout!.on("data", (chunk: Buffer) => {
 			jsonBuf += chunk.toString();
-			// Process complete JSON lines
 			let newlineIdx: number;
 			while ((newlineIdx = jsonBuf.indexOf("\n")) !== -1) {
 				const line = jsonBuf.slice(0, newlineIdx).trim();
 				jsonBuf = jsonBuf.slice(newlineIdx + 1);
 				if (!line) continue;
-				try {
-					const evt = JSON.parse(line);
-					handleJsonEvent(evt);
-				} catch { /* skip malformed lines */ }
+				try { handleJsonEvent(JSON.parse(line)); } catch {}
 			}
 		});
 		child.stderr!.on("data", () => {});
 
 		child.on("close", (code) => {
-			// Process any remaining buffer
 			if (jsonBuf.trim()) {
 				try { handleJsonEvent(JSON.parse(jsonBuf.trim())); } catch {}
 			}
+			stopStreamRender();
 			cleanupTmp();
 			if (childProcess !== child) return;
 			childProcess = null;
@@ -169,14 +181,12 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			phase = "thinking";
 		} else if (t === "thinking_delta" && delta) {
 			thinking += delta;
-			tuiRef?.requestRender(true);
 		} else if (t === "thinking_end") {
 			// thinking complete, wait for text
 		} else if (t === "text_start") {
 			phase = "responding";
 		} else if (t === "text_delta" && delta) {
 			pa += delta;
-			tuiRef?.requestRender(true);
 		} else if (t === "text_end") {
 			// text complete
 		}
@@ -232,54 +242,68 @@ export default function sideExtension(pi: ExtensionAPI): void {
 						const n = s.exchanges.length;
 						const cw = Math.max(w - 4, 10);
 
-						const statusIcon = phase === "thinking" ? "🧠" : pending ? "↔" : "💬";
+						const statusIcon = phase === "thinking" ? "#" : pending ? "*" : "+";
 						const title = `${statusIcon} Side Chat${n ? ` (${n})` : ""}`;
-						lines.push(theme.fg("accent", theme.bold(`╭─ ${title}${"─".repeat(Math.max(0, w - title.length - 4))}`)));
+						const border = theme.fg("accent", " |");
+						const dim = (t: string) => theme.fg("dim", t);
+						const acc = (t: string) => theme.fg("accent", t);
 
+						lines.push(acc(`+-${title}${"-".repeat(Math.max(0, w - title.length - 4))}-+`));
+
+						// Previous exchanges
 						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 14) / 5));
 						const start = Math.max(0, n - MAX);
-						if (start > 0) lines.push(theme.fg("dim", `│  ... (${start} earlier)`));
+						if (start > 0) lines.push(dim(`|  ... (${start} earlier)`));
 						for (let i = start; i < n; i++) {
 							const e = s.exchanges[i];
-							const q = e.question.length > cw - 5 ? e.question.slice(0, cw - 8) + "…" : e.question;
-							lines.push(theme.fg("accent", "│ ▸ ") + q);
+							const q = e.question.length > cw - 5 ? e.question.slice(0, cw - 8) + "~" : e.question;
+							lines.push(acc(`| > `) + q);
 							for (const l of e.answer.split("\n").slice(0, 6)) {
-								lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
+								lines.push(acc("|  ") + (l.length > cw ? l.slice(0, cw - 1) + "~" : l));
 							}
-							if (i < n - 1) lines.push(theme.fg("dim", "│"));
+							if (i < n - 1) lines.push(dim("|"));
 						}
 
+						// Current pending exchange
 						if (pending) {
-							if (n) lines.push(theme.fg("dim", "│"));
-							const q = pq.length > cw - 5 ? pq.slice(0, cw - 8) + "…" : pq;
-							lines.push(theme.fg("accent", "│ ▸ ") + q);
+							if (n) lines.push(dim("|"));
+							const q = pq.length > cw - 5 ? pq.slice(0, cw - 8) + "~" : pq;
+							lines.push(acc(`| > `) + q);
 
-							// Show thinking (reasoning) in dim style
-							if (thinking) {
-								const recentThink = thinking.split("\n").slice(-3);
+							// Show thinking (reasoning) while thinking
+							if (phase === "thinking" && thinking) {
+								const recentThink = thinking.split("\n").slice(-4);
 								for (const l of recentThink) {
-									lines.push(theme.fg("dim", "│  💭 ") + theme.fg("dim", l.length > cw - 6 ? l.slice(0, cw - 9) + "…" : l));
+									const clipped = l.length > cw - 6 ? l.slice(0, cw - 9) + "~" : l;
+									lines.push(dim("|  [think] ") + dim(clipped));
 								}
 							}
 
-							// Show response text
+							// Show response text (prefer text over thinking when responding)
 							if (pa) {
 								const aLines = pa.split("\n");
-								for (const l of aLines.slice(-6)) {
-									lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
+								for (const l of aLines.slice(-8)) {
+									lines.push(acc("|  ") + (l.length > cw ? l.slice(0, cw - 1) + "~" : l));
 								}
-							} else if (phase === "idle" && !thinking) {
-								lines.push(theme.fg("dim", "│  ⋯ starting subprocess"));
-							} else if (phase === "thinking" && !pa) {
-								lines.push(theme.fg("dim", "│  ⋯ thinking..."));
+							} else if (phase === "thinking") {
+								// Show brief thinking snipe while thinking (no response yet)
+								if (thinking) {
+									const tail = thinking.split("\n").pop() || "";
+									const clipped = tail.length > cw - 12 ? tail.slice(0, cw - 15) + "~" : tail;
+									lines.push(dim("|  [think] ") + dim(clipped));
+								} else {
+									lines.push(dim("|  [think] ..."));
+								}
+							} else if (phase === "idle") {
+								lines.push(dim("|  [wait] ..."));
 							}
 						}
 
-						lines.push(theme.fg("accent", "├" + "─".repeat(w - 2) + "┤"));
-						const inputLines = input.render(w - 2).map((l) => theme.fg("accent", "│ ") + l);
+						lines.push(acc("+-" + "-".repeat(w - 2) + "-+"));
+						const inputLines = input.render(w - 2).map((l) => acc("| ") + l);
 						lines.push(...inputLines);
-						lines.push(theme.fg("accent", "╰" + "─".repeat(w - 2) + "╯"));
-						lines.push(theme.fg("dim", "  Type + Enter · Esc or /close to exit"));
+						lines.push(acc("+-" + "-".repeat(w - 2) + "-+"));
+						lines.push(dim("  Type + Enter · Esc or /close to exit"));
 
 						return lines;
 					},
