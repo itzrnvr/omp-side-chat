@@ -67,6 +67,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	pi.on("message_end", (event, ctx: ExtensionContext) => {
 		if (!pending || !session) return;
 		const msg = event.message as { role: string; content: unknown };
+		if (msg.role !== "assistant") return;
 		let answer = "";
 		if (typeof msg.content === "string") answer = msg.content;
 		else if (Array.isArray(msg.content)) {
