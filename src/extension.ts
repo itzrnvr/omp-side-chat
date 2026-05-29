@@ -1,22 +1,23 @@
 /**
- * Side Chat — Split-view side panel for ephemeral multi-turn conversation.
+ * Side Chat — Split-view side panel with ISOLATED subprocess session.
  *
- * /side [question]  — Open sidechat (right half of terminal). If question given, send it.
- * /close            — Close the sidechat and save session
- * /side close       — Also closes the sidechat (alias)
+ * /side [question]  — Open sidechat (right half of terminal).
+ * /side close       — Close the sidechat and save session
  * /side clear       — Clear saved session
+ * /close            — Shortcut to close sidechat
  *
- * When sidechat is open, all input goes to the sidechat. Type question + Enter to send.
- * Type /close or press Esc to exit back to main session.
+ * When sidechat is open, all input goes to the sidechat.
+ * Questions run in a SEPARATE omp subprocess (--no-session, no tools).
+ * Nothing appears in the main session.
  */
 
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
-	ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Input } from "@oh-my-pi/pi-tui";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -24,24 +25,25 @@ import * as os from "node:os";
 interface SideExchange { question: string; answer: string }
 interface SideSession { exchanges: SideExchange[]; createdAt: number }
 
-const DIR = path.join(os.homedir(), ".omp", "side-sessions");
-const save = (s: SideSession) => { try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(path.join(DIR, "latest.json"), JSON.stringify(s), "utf-8"); } catch {} };
-const load = (): SideSession | undefined => { try { return JSON.parse(fs.readFileSync(path.join(DIR, "latest.json"), "utf-8")); } catch {} };
-const nuke = () => { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} };
+const SESSION_DIR = path.join(os.homedir(), ".omp", "side-sessions");
+const save = (s: SideSession) => { try { fs.mkdirSync(SESSION_DIR, { recursive: true }); fs.writeFileSync(path.join(SESSION_DIR, "latest.json"), JSON.stringify(s), "utf-8"); } catch {} };
+const load = (): SideSession | undefined => { try { return JSON.parse(fs.readFileSync(path.join(SESSION_DIR, "latest.json"), "utf-8")); } catch {} };
+const nuke = () => { try { fs.unlinkSync(path.join(SESSION_DIR, "latest.json")); } catch {} };
 
-function prompt(q: string, hist: SideExchange[]): string {
-	const h = hist.length ? "\nPrevious exchanges:\n" + hist.map((e, i) => `Q${i+1}: ${e.question}\nA${i+1}: ${e.answer}`).join("\n\n") + "\n" : "";
-	return `<side>\nEphemeral side conversation. Answer briefly from context. NO tools. NO follow-up questions.\n${h}Question: ${q}\n</side>`;
-}
-
-function extractMsgContent(msg: { content: unknown }): string {
-	if (typeof msg.content === "string") return msg.content;
-	if (Array.isArray(msg.content)) {
-		return msg.content
-			.map((p) => (typeof p === "object" && p && "text" in p ? (p as { text: string }).text : ""))
-			.join("");
+function buildTaskPrompt(question: string, history: SideExchange[]): string {
+	const parts: string[] = [
+		"This is an ephemeral side conversation. Answer briefly. DO NOT use any tools.",
+	];
+	if (history.length) {
+		parts.push("\nPrevious exchanges:");
+		for (let i = 0; i < history.length; i++) {
+			const e = history[i];
+			parts.push(`Q${i + 1}: ${e.question}`);
+			parts.push(`A${i + 1}: ${e.answer}`);
+		}
 	}
-	return "";
+	parts.push(`\nQuestion: ${question}`);
+	return parts.join("\n");
 }
 
 export default function sideExtension(pi: ExtensionAPI): void {
@@ -52,8 +54,20 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let sideOverlay: OverlayHandle | undefined;
 	let unsubInput: (() => void) | undefined;
 	let tuiRef: TUI | undefined;
+	let childProcess: ChildProcess | null = null;
+	let tmpDir: string | null = null;
+
+	function cleanupTmp() {
+		if (tmpDir) {
+			try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+			tmpDir = null;
+		}
+	}
 
 	function closeSidechat() {
+		childProcess?.kill();
+		childProcess = null;
+		cleanupTmp();
 		if (pending && session) {
 			session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
 			pending = false; pq = ""; pa = "";
@@ -69,11 +83,16 @@ export default function sideExtension(pi: ExtensionAPI): void {
 
 	function submitQuestion(question: string) {
 		if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
-		// Reject empty submissions (handles CRLF double-submit)
 		if (!question.trim()) return;
-		if (pending) {
-			session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
-			pending = false;
+		if (childProcess) {
+			// Kill previous in-flight question
+			childProcess.kill();
+			childProcess = null;
+			cleanupTmp();
+			if (pending) {
+				session.exchanges.push({ question: pq, answer: pa || "(cancelled)" });
+				pending = false;
+			}
 		}
 		if (question === "/close" || question === "/side close") {
 			closeSidechat();
@@ -82,33 +101,56 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		pq = question.trim();
 		pa = "";
 		pending = true;
-		pi.sendUserMessage(prompt(pq, session.exchanges));
 		tuiRef?.requestRender(true);
-	}
 
-	// Live streaming
-	pi.on("message_update", (event) => {
-		if (!pending || !session) return;
-		if (event.assistantMessageEvent?.type === "text_delta") {
-			pa += event.assistantMessageEvent.delta ?? "";
+		// Write prompt to temp file (avoids shell quoting issues)
+		const taskPrompt = buildTaskPrompt(pq, session.exchanges);
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "side-chat-"));
+		const promptPath = path.join(tmpDir, "prompt.md");
+		fs.writeFileSync(promptPath, taskPrompt, { mode: 0o600 });
+
+		// Spawn isolated omp subprocess
+		const child = spawn("omp", [
+			"-p",
+			"--no-session",
+			"--no-extensions",
+			"--no-skills",
+			"--no-tools",
+			"--no-title",
+			`@${promptPath}`,
+		], {
+			stdio: ["ignore", "pipe", "pipe"],
+			shell: true,
+			windowsHide: true,
+		});
+		childProcess = child;
+
+		let output = "";
+		child.stdout!.on("data", (chunk: Buffer) => {
+			output += chunk.toString();
+			pa = output.trim();
 			tuiRef?.requestRender(true);
-		}
-	});
+		});
 
-	pi.on("message_end", (event) => {
-		if (!pending || !session) return;
-		const msg = event.message as { role: string; content: unknown };
-		if (msg.role !== "assistant") return;
-		const answer = pa.trim() || extractMsgContent(msg) || "(no answer)";
-		session.exchanges.push({ question: pq, answer });
-		pending = false; pq = ""; pa = "";
-		save(session);
-		tuiRef?.requestRender(true);
-	});
+		child.stderr!.on("data", () => { /* discard */ });
+
+		child.on("close", (code) => {
+			cleanupTmp();
+			if (childProcess !== child) return; // superseded
+			childProcess = null;
+			const answer = (code === 0 ? output.trim() : `(error: exit ${code})`) || "(no answer)";
+			if (session) {
+				session.exchanges.push({ question: pq, answer });
+				save(session);
+			}
+			pending = false; pq = ""; pa = "";
+			tuiRef?.requestRender(true);
+		});
+	}
 
 	// /side command
 	pi.registerCommand("side", {
-		description: "Open side chat session (right half of terminal)",
+		description: "Open isolated side chat (right half of terminal)",
 		getArgumentCompletions: (pfx) => {
 			const s: string[] = [];
 			if (sideOverlay || session || load()) s.push("close", "clear");
@@ -118,28 +160,19 @@ export default function sideExtension(pi: ExtensionAPI): void {
 			const raw = args.trim();
 			const cmd = raw.toLowerCase();
 
-			if (cmd === "close") {
-				closeSidechat();
-				ctx.ui.notify("Side chat closed", "info");
-				return;
-			}
+			if (cmd === "close") { closeSidechat(); ctx.ui.notify("Side chat closed", "info"); return; }
 			if (cmd === "clear") {
 				if (!sideOverlay) session = undefined;
 				nuke();
 				ctx.ui.notify("Side chat cleared", "info");
 				return;
 			}
-
-			// If overlay already open, submit question via the active session
 			if (sideOverlay) {
 				if (raw) submitQuestion(raw);
 				return;
 			}
-
-			// Initialize session
 			if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
 
-			// Open sidechat overlay via custom()
 			await ctx.ui.custom<void>(async (tui, theme, _kb, done) => {
 				tuiRef = tui;
 
@@ -149,11 +182,8 @@ export default function sideExtension(pi: ExtensionAPI): void {
 					input.setValue("");
 					tui.requestRender(true);
 				};
-				input.onEscape = () => {
-					closeSidechat();
-				};
+				input.onEscape = () => { closeSidechat(); };
 
-				// Panel component: right-side chat UI with its own input
 				const panel: Component = {
 					handleInput(data: string) {
 						input.handleInput(data);
@@ -166,16 +196,13 @@ export default function sideExtension(pi: ExtensionAPI): void {
 						const n = s.exchanges.length;
 						const cw = Math.max(w - 4, 10);
 
-						// Header
 						const icon = pending ? "↔" : "💬";
 						const title = `${icon} Side Chat${n ? ` (${n})` : ""}`;
 						lines.push(theme.fg("accent", theme.bold(`╭─ ${title}${"─".repeat(Math.max(0, w - title.length - 4))}`)));
 
-						// Scrollback for long history
 						const MAX = Math.max(3, Math.floor((tui.terminal.rows - 10) / 4));
 						const start = Math.max(0, n - MAX);
 						if (start > 0) lines.push(theme.fg("dim", `│  ... (${start} earlier)`));
-
 						for (let i = start; i < n; i++) {
 							const e = s.exchanges[i];
 							const q = e.question.length > cw - 5 ? e.question.slice(0, cw - 8) + "…" : e.question;
@@ -185,73 +212,54 @@ export default function sideExtension(pi: ExtensionAPI): void {
 							}
 							if (i < n - 1) lines.push(theme.fg("dim", "│"));
 						}
-
-						// Pending exchange
 						if (pending) {
 							if (n) lines.push(theme.fg("dim", "│"));
 							const q = pq.length > cw - 5 ? pq.slice(0, cw - 8) + "…" : pq;
 							lines.push(theme.fg("accent", "│ ▸ ") + q);
 							if (pa) {
-								for (const l of pa.split("\n").slice(-4)) {
+								// Show last few lines of streaming output
+								const answerLines = pa.split("\n");
+								for (const l of answerLines.slice(-4)) {
 									lines.push(theme.fg("accent", "│  ") + (l.length > cw ? l.slice(0, cw - 1) + "…" : l));
 								}
 							} else {
-								lines.push(theme.fg("dim", "│  ⋯"));
+								lines.push(theme.fg("dim", "│  ⋯ starting subprocess"));
 							}
 						}
 
-						// Separator
 						lines.push(theme.fg("accent", "├" + "─".repeat(w - 2) + "┤"));
-
-						// Input field
 						const inputLines = input.render(w - 2).map((l) => theme.fg("accent", "│ ") + l);
 						lines.push(...inputLines);
-
-						// Bottom border
 						lines.push(theme.fg("accent", "╰" + "─".repeat(w - 2) + "╯"));
-
-						// Footer hint
 						lines.push(theme.fg("dim", "  Type your question + Enter · Esc to exit"));
 
 						return lines;
 					},
-					invalidate() {
-						input.invalidate();
-					},
+					invalidate() { input.invalidate(); },
 				};
 
-				// Create overlay on the right half
 				sideOverlay = tui.showOverlay(panel, {
 					anchor: "right-center",
 					width: "50%",
 					maxHeight: "100%",
 				});
 
-				// Capture all terminal input for the sidechat
 				unsubInput?.();
 				unsubInput = ctx.ui.onTerminalInput((data) => {
-					// Only while overlay is active
 					if (!sideOverlay) return;
 					input.handleInput(data);
 					tui.requestRender(true);
 					return { consume: true };
 				});
 
-				// Submit initial question if provided
-				if (raw) {
-					submitQuestion(raw);
-				}
+				if (raw) submitQuestion(raw);
 
-				// Release the custom() — overlay persists via sideOverlay handle
 				done(undefined);
-
-				// Return a stub (not rendered)
 				return { render() { return []; }, invalidate() {} };
 			}, { overlay: true });
 		},
 	});
 
-	// /close shortcut
 	pi.registerCommand("close", {
 		description: "Close the side chat panel",
 		handler: async (_args, ctx) => {
