@@ -1,11 +1,12 @@
 /**
- * Side Chat — Multi-turn ephemeral conversation with inline TUI.
+ * Side Chat — Multi-turn ephemeral conversation.
  *
  * /side           — Open/resume side chat
  * /side close     — Close and save
  * /side clear     — Close and discard
  *
- * Uses setWidget for the chat view and onTerminalInput for raw keystrokes.
+ * The widget renders below the editor. onTerminalInput captures keystrokes.
+ * Only message_end is used for answer capture (reliable, no async race).
  */
 
 import type {
@@ -23,133 +24,143 @@ interface SideExchange { question: string; answer: string }
 interface SideSession { exchanges: SideExchange[]; createdAt: number }
 
 const DIR = path.join(os.homedir(), ".omp", "side-sessions");
-function save(s: SideSession) { try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(path.join(DIR, "latest.json"), JSON.stringify(s), "utf-8"); } catch {} }
-function load(): SideSession | undefined { try { return JSON.parse(fs.readFileSync(path.join(DIR, "latest.json"), "utf-8")); } catch {} }
-function clearSave() { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} }
+const persist = (s: SideSession) => { try { fs.mkdirSync(DIR, { recursive: true }); fs.writeFileSync(path.join(DIR, "latest.json"), JSON.stringify(s), "utf-8"); } catch {} };
+const restore = (): SideSession | undefined => { try { return JSON.parse(fs.readFileSync(path.join(DIR, "latest.json"), "utf-8")); } catch {} };
+const purge = () => { try { fs.unlinkSync(path.join(DIR, "latest.json")); } catch {} };
 
-function makePrompt(q: string, hist: SideExchange[]): string {
-	const h = hist.length === 0 ? "" :
-		"\nPrevious exchanges:\n" + hist.map((e, i) => `Q${i+1}: ${e.question}\nA${i+1}: ${e.answer}`).join("\n\n") + "\n";
-	return `<side>\nThis is an ephemeral side conversation. Answer briefly using existing context.\nDO NOT use any tools. DO NOT ask follow-up questions.\n${h}Question: ${q}\n</side>`;
+function sidePrompt(q: string, hist: SideExchange[]): string {
+	const h = hist.length ? "\nPrevious exchanges:\n" + hist.map((e, i) => `Q${i+1}: ${e.question}\nA${i+1}: ${e.answer}`).join("\n\n") + "\n" : "";
+	return `<side>\nEphemeral side conversation. Answer briefly from context. NO tools. NO follow-up questions.\n${h}Question: ${q}\n</side>`;
 }
 
 export default function sideExtension(pi: ExtensionAPI): void {
 	let session: SideSession | undefined;
-	let streaming = false;
-	let sq = "";
-	let sa = "";
-	let expecting = false;
 	let active = false;
-	let unsubInput: (() => void) | undefined;
+	let unsub: (() => void) | undefined;
+	let pending = false;   // waiting for message_end
+	let pendingQ = "";
 	const inp = new Input();
 
-	function render(ctx: { ui: ExtensionUIContext }) {
-		if (!session) { ctx.ui.setWidget("side", undefined); ctx.ui.setStatus("side", undefined); return; }
-		const t = ctx.ui.theme;
+	// -------------------------------------------------------------------
+	// Render widget
+	// -------------------------------------------------------------------
+
+	function render(ui: ExtensionUIContext) {
+		if (!session) { ui.setWidget("side", undefined); ui.setStatus("side", undefined); return; }
+		const t = ui.theme;
 		const lines: string[] = [];
 		const n = session.exchanges.length;
-		lines.push(t.fg("accent", t.bold(`${streaming ? "↔" : "💬"} Side Chat${n ? ` (${n})` : ""}`)));
+		const icon = pending ? "↔" : "💬";
+		lines.push(t.fg("accent", t.bold(`${icon} Side Chat${n ? ` (${n})` : ""}`)));
 		lines.push(t.fg("dim", "─".repeat(50)));
 		for (let i = 0; i < session.exchanges.length; i++) {
-			const ex = session.exchanges[i];
-			lines.push(t.fg("accent", `  ▸ ${ex.question}`));
-			for (const l of ex.answer.split("\n")) lines.push(`    ${l}`);
+			const e = session.exchanges[i];
+			lines.push(t.fg("accent", `  ▸ ${e.question}`));
+			for (const l of e.answer.split("\n")) lines.push(`    ${l}`);
 			if (i < session.exchanges.length - 1) lines.push("");
 		}
-		if (streaming) {
-			if (session.exchanges.length) lines.push("");
-			lines.push(t.fg("accent", `  ▸ ${sq}`));
-			lines.push(t.fg("dim", "    ⋯"));
+		if (pending) {
+			if (n) lines.push("");
+			lines.push(t.fg("accent", `  ▸ ${pendingQ}`));
+			lines.push(t.fg("dim", "    ⋯ waiting for response"));
 		}
 		lines.push("");
-		const hint = streaming ? "Streaming..." : "Type + Enter to ask · Esc to close";
-		lines.push(t.fg("dim", `  ${hint}`));
+		lines.push(t.fg("dim", pending ? "  Streaming... Esc=close" : "  Type+Enter=ask · Esc=close and save"));
 		const buf = inp.getValue();
-		if (buf && !streaming) lines.push(t.fg("accent", `  > ${buf}█`));
-		ctx.ui.setWidget("side", lines, { placement: "belowEditor" });
-		ctx.ui.setStatus("side", streaming ? "↔ Side chat" : "💬 Side chat");
+		if (buf && !pending) { lines.push(""); lines.push(t.fg("accent", `  ▸ ${buf}█`)); }
+		ui.setWidget("side", lines, { placement: "belowEditor" });
+		ui.setStatus("side", pending ? "↔ Side chat" : "💬 Side chat");
 	}
 
-	// Capture full answer from message_end
+	// -------------------------------------------------------------------
+	// Capture completed answer
+	// -------------------------------------------------------------------
+
 	pi.on("message_end", (event, ctx: ExtensionContext) => {
-		if (!streaming || !expecting || !session) return;
-		expecting = false;
-		// Extract text from the completed message
+		if (!pending || !session) return;
 		const msg = event.message as { role: string; content: unknown };
 		let answer = "";
-		if (typeof msg.content === "string") {
-			answer = msg.content;
-		} else if (Array.isArray(msg.content)) {
-			for (const part of msg.content) {
-				if (typeof part === "object" && part && "text" in part) answer += (part as { text: string }).text;
+		if (typeof msg.content === "string") answer = msg.content;
+		else if (Array.isArray(msg.content)) {
+			for (const p of msg.content) {
+				if (typeof p === "object" && p && "text" in p) answer += (p as { text: string }).text;
 			}
 		}
-		session.exchanges.push({ question: sq, answer: answer.trim() || "(no answer)" });
-		streaming = false; sq = ""; sa = "";
-		save(session);
-		render(ctx);
+		session.exchanges.push({ question: pendingQ, answer: answer.trim() || "(no answer)" });
+		pending = false; pendingQ = "";
+		persist(session);
+		render(ctx.ui);
 	});
 
-	function close(ctx: { ui: ExtensionUIContext }) {
-		if (streaming && session) {
-			session.exchanges.push({ question: sq, answer: sa || "(cancelled)" });
-			streaming = false; expecting = false; sq = ""; sa = "";
+	// -------------------------------------------------------------------
+	// Open/close
+	// -------------------------------------------------------------------
+
+	function close(ui: ExtensionUIContext) {
+		if (pending && session) {
+			session.exchanges.push({ question: pendingQ, answer: "(cancelled)" });
+			pending = false; pendingQ = "";
 		}
-		if (session) save(session);
+		if (session) persist(session);
 		session = undefined; active = false; inp.setValue("");
-		unsubInput?.(); unsubInput = undefined;
-		render(ctx);
+		unsub?.(); unsub = undefined;
+		render(ui);
 	}
 
-	function openSession(ctx: ExtensionCommandContext) {
-		if (!session) session = load() ?? { exchanges: [], createdAt: Date.now() };
+	function open(ui: ExtensionUIContext) {
+		if (!session) session = restore() ?? { exchanges: [], createdAt: Date.now() };
 		active = true; inp.setValue("");
-		unsubInput = ctx.ui.onTerminalInput((data: string) => {
+		unsub?.();
+		unsub = ui.onTerminalInput((data: string) => {
 			if (!active || !session) return;
-			if (data === "\x1b" || data === "\x03") { close(ctx); return { consume: true }; }
+			// Escape/Ctrl+C: close
+			if (data === "\x1b" || data === "\x03") { close(ui); return { consume: true }; }
+			// Forward slash: let it through (don't consume) so /side close works
+			if (data === "/") return { consume: false };
+			// Enter: submit
 			if (data === "\n" || data === "\r") {
-				const val = inp.getValue().trim();
-				if (!val) return { consume: true };
-				if (streaming) {
-					session.exchanges.push({ question: sq, answer: sa || "(cancelled)" });
-					streaming = false; expecting = false;
-				}
-				sq = val; sa = ""; streaming = true;
-				inp.setValue(""); render(ctx);
-				expecting = true;
-				pi.sendUserMessage(makePrompt(sq, session.exchanges));
+				const v = inp.getValue().trim();
+				if (!v || pending) return { consume: true }; // block while streaming
+				pendingQ = v; pending = true;
+				inp.setValue(""); render(ui);
+				pi.sendUserMessage(sidePrompt(pendingQ, session.exchanges));
 				return { consume: true };
 			}
-			inp.handleInput(data); render(ctx);
+			// All other input goes to the Input component
+			inp.handleInput(data); render(ui);
 			return { consume: true };
 		});
-		render(ctx);
-		ctx.ui.notify("💬 Side chat — type your question · Esc to close", "info");
+		render(ui);
+		ui.notify("💬 Side chat — type your question · Esc to close", "info");
 	}
+
+	// -------------------------------------------------------------------
+	// Command
+	// -------------------------------------------------------------------
 
 	pi.registerCommand("side", {
 		description: "Multi-turn side conversation",
 		getArgumentCompletions: (pfx) => {
 			const s: string[] = [];
-			if (session || load()) s.push("resume");
+			if (session || restore()) s.push("resume");
 			if (session) s.push("close", "clear");
 			return s.filter(v => !pfx || v.startsWith(pfx)).map(v => ({ label: v, value: v }));
 		},
 		handler: async (args, ctx) => {
 			const cmd = args.trim().toLowerCase();
-			if (cmd === "close") { close(ctx); ctx.ui.notify("Side chat saved", "info"); return; }
+			if (cmd === "close") { close(ctx.ui); ctx.ui.notify("Side chat saved", "info"); return; }
 			if (cmd === "clear") {
-				session = undefined; streaming = false; expecting = false; active = false; sq = ""; sa = "";
-				unsubInput?.(); unsubInput = undefined; clearSave();
-				render(ctx); ctx.ui.notify("Side chat cleared", "info"); return;
+				session = undefined; pending = false; pendingQ = ""; active = false;
+				unsub?.(); unsub = undefined; purge();
+				render(ctx.ui); ctx.ui.notify("Side chat cleared", "info"); return;
 			}
 			if (cmd === "resume") {
-				if (!session) session = load();
-				if (!session) { ctx.ui.notify("No previous side chat", "warning"); return; }
-				openSession(ctx); return;
+				if (!session) session = restore();
+				if (!session) { ctx.ui.notify("No previous session", "warning"); return; }
+				open(ctx.ui); return;
 			}
 			if (cmd) { ctx.ui.notify("Usage: /side | /side close | /side clear | /side resume", "info"); return; }
-			openSession(ctx);
+			open(ctx.ui);
 		},
 	});
 }
