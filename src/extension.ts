@@ -38,7 +38,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 	let pq = "";
 	let pa = "";
 
-	function render(ui: ExtensionUIContext) {
+	function extractMsgContent(msg: any): string { if(typeof msg.content==="string")return msg.content; if(Array.isArray(msg.content))return msg.content.map((p:any)=>typeof p==="object"&&p&&"text"in p?p.text:"").join("");return"";} function render(ui: ExtensionUIContext) {
 		if (!session) { ui.setWidget("side", undefined); ui.setStatus("side", undefined); return; }
 
 		ui.setWidget("side", (_tui: TUI, theme) => {
@@ -102,7 +102,7 @@ export default function sideExtension(pi: ExtensionAPI): void {
 		if (!pending || !session) return;
 		const msg = event.message as { role: string; content: unknown };
 		if (msg.role !== "assistant") return;
-		session.exchanges.push({ question: pq, answer: pa.trim() || "(no answer)" });
+		session.exchanges.push({ question: pq, answer: pa.trim() || extractMsgContent(msg) || "(no answer)" });
 		pending = false; pq = ""; pa = "";
 		save(session);
 		render(ctx.ui);
